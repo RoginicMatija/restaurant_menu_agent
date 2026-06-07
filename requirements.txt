@@ -1,0 +1,9 @@
+pydantic
+python-dotenv
+firecrawl-py
+google-genai
+googlemaps
+geocoder
+playwright
+streamlit
+streamlit-geolocation
