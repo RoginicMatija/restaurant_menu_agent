@@ -3,13 +3,14 @@ import json
 import datetime
 import re
 import os
+from io import BytesIO
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 from firecrawl import Firecrawl
 from google import genai
 from playwright.sync_api import sync_playwright
-from restaurant_menu_agent.config import RestaurantSummary, MENU_PROMPT, REGULAR_MENU_PROMPT
+from config import RestaurantSummary, MENU_PROMPT, REGULAR_MENU_PROMPT
 
 load_dotenv()
 MAPPING = {
@@ -21,6 +22,29 @@ MAPPING = {
     "Saturday": "SUBOTA",
     "Sunday": "NEDJELJA",
 }
+
+DAY_EN_TO_HR_LOWER = {
+    "Monday": "ponedjeljak",
+    "Tuesday": "utorak",
+    "Wednesday": "srijeda",
+    "Thursday": "četvrtak",
+    "Friday": "petak",
+    "Saturday": "subota",
+    "Sunday": "nedjelja",
+}
+
+FAKIN_WP_MEDIA_API = (
+    "https://pivovara-medvedgrad.hr/wp-json/wp/v2/media?search=FAKIN&per_page=10"
+)
+FAKIN_DAY_HEADER_PATTERN = re.compile(
+    r"^(ponedjeljak|utorak|srijeda|četvrtak|cetvrtak|petak|subota|nedjelja)\s+(\d{1,2})\.(\d{1,2})\.\s*$",
+    re.I | re.M,
+)
+FAKIN_SECTION_END_PATTERN = re.compile(
+    r"^(ponedjeljak|utorak|srijeda|četvrtak|cetvrtak|petak|subota|nedjelja)\s+\d{1,2}\.\d{1,2}\.|novo u ponudi",
+    re.I | re.M,
+)
+FAKIN_GABLEC_PRICE_LINE = re.compile(r"^([\d]+,[\d]{2})\s*€\s*$", re.I)
 
 HARDCODED_RESTAURANTS = [
     {"name": "Fakin", "url": "https://pivovara-medvedgrad.hr/fakin/gableci"},
@@ -351,19 +375,157 @@ def has_valid_menu(
 
 
 def extract_fakin_daily_markdown(markdown: str, reference: datetime.date) -> str:
-    """Keep only today's section when the date is present on the page."""
-    current_date = f"{reference.day}.{reference.month}"
-    if current_date not in markdown:
+    """Keep only today's gablec section; strip permanent 'novo u ponudi' block."""
+    lowered = markdown.lower()
+    novo_pos = lowered.find("novo u ponudi")
+    if novo_pos != -1:
+        markdown = markdown[novo_pos:]
+        next_day = FAKIN_DAY_HEADER_PATTERN.search(markdown)
+        if next_day:
+            markdown = markdown[next_day.start():]
+
+    day_hr = DAY_EN_TO_HR_LOWER[reference.strftime("%A")]
+    header = re.compile(
+        rf"^{re.escape(day_hr)}\s+{reference.day}\.{reference.month}\.\s*$",
+        re.I | re.M,
+    )
+    match = header.search(markdown)
+    if not match:
+        current_date = f"{reference.day}.{reference.month}"
+        if current_date in markdown:
+            chunk = markdown.split(current_date, 1)[1]
+            return f"{current_date}{chunk[:2500]}"
         return markdown
 
-    chunk = markdown.split(current_date, 1)[1]
-    lower = chunk.lower()
-    end_pos = len(chunk)
-    for marker in NEXT_DAY_MARKERS:
-        pos = lower.find(marker, 10)
-        if pos != -1 and pos < end_pos:
-            end_pos = pos
-    return f"{current_date}{chunk[:end_pos]}"
+    section = markdown[match.end():]
+    end_match = FAKIN_SECTION_END_PATTERN.search(section)
+    if end_match:
+        section = section[:end_match.start()]
+    return section.strip()
+
+
+def fetch_latest_fakin_pdf_url() -> str | None:
+    """Resolve the current weekly Fakin gablec PDF from the WordPress media API."""
+    req = Request(FAKIN_WP_MEDIA_API, headers={"User-Agent": BROWSER_UA})
+    try:
+        with urlopen(req, timeout=20) as resp:
+            items = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    for item in items:
+        url = item.get("source_url", "")
+        if "Cjenik-tjedan" in url and url.upper().endswith("FAKIN.PDF"):
+            return url
+    return None
+
+
+def fetch_pdf_text(pdf_url: str) -> str:
+    req = Request(pdf_url, headers={"User-Agent": BROWSER_UA})
+    with urlopen(req, timeout=30) as resp:
+        pdf_bytes = resp.read()
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(BytesIO(pdf_bytes))
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def parse_fakin_gablec_from_text(text: str, reference: datetime.date) -> list[dict]:
+    """Parse today's three gablec dishes from the weekly Fakin PDF text."""
+    if reference.weekday() >= 5:
+        return []
+
+    day_hr = DAY_EN_TO_HR_LOWER[reference.strftime("%A")]
+    header = re.compile(
+        rf"^{re.escape(day_hr)}\s+{reference.day}\.{reference.month}\.\s*$",
+        re.I | re.M,
+    )
+    match = header.search(text)
+    if not match:
+        return []
+
+    section = text[match.end():]
+    end_match = FAKIN_SECTION_END_PATTERN.search(section)
+    if end_match:
+        section = section[:end_match.start()]
+
+    items: list[dict] = []
+    buffer: list[str] = []
+    for raw_line in section.splitlines():
+        line = raw_line.strip().rstrip(",")
+        if not line:
+            continue
+        price_match = FAKIN_GABLEC_PRICE_LINE.match(line)
+        if price_match:
+            name = " ".join(buffer).strip()
+            if name:
+                items.append({
+                    "item_name": name,
+                    "price": normalize_price(f"{price_match.group(1)} €"),
+                    "description": "",
+                    "category": "Other",
+                })
+            buffer = []
+        else:
+            buffer.append(line)
+
+    return items
+
+
+def scrape_fakin_daily_menu(reference: datetime.date | None = None) -> dict:
+    """Load Fakin gableci from the official weekly PDF (deterministic)."""
+    reference = reference or datetime.date.today()
+
+    if reference.weekday() >= 5:
+        return {
+            "restaurant_name": "Fakin",
+            "is_daily_menu_available": False,
+            "specials": [],
+            "general_vibe": "Gableci su dostupni pon–pet.",
+        }
+
+    pdf_url = fetch_latest_fakin_pdf_url()
+    if not pdf_url:
+        print("   Could not find Fakin weekly PDF URL.")
+        return {
+            "restaurant_name": "Fakin",
+            "is_daily_menu_available": False,
+            "specials": [],
+            "general_vibe": "Weekly menu PDF not found.",
+        }
+
+    print(f"   Using Fakin PDF: {pdf_url}")
+    try:
+        pdf_text = fetch_pdf_text(pdf_url)
+    except Exception as exc:
+        print(f"   Failed to read Fakin PDF: {exc}")
+        return {
+            "restaurant_name": "Fakin",
+            "is_daily_menu_available": False,
+            "specials": [],
+            "general_vibe": "Could not read weekly menu PDF.",
+        }
+
+    specials = parse_fakin_gablec_from_text(pdf_text, reference)
+    if specials:
+        print(f"   Parsed {len(specials)} gablec items for {reference.strftime('%A %d.%m.')}")
+        return {
+            "restaurant_name": "Fakin",
+            "is_daily_menu_available": True,
+            "specials": specials,
+            "general_vibe": (
+                f"Dnevni gableci za {DAY_EN_TO_HR_LOWER[reference.strftime('%A')]} "
+                f"{reference.day}.{reference.month}."
+            ),
+        }
+
+    return {
+        "restaurant_name": "Fakin",
+        "is_daily_menu_available": False,
+        "specials": [],
+        "general_vibe": f"Nema gableca za {reference.day}.{reference.month}. u tjednom PDF-u.",
+    }
 
 
 def _html_to_text(html: str) -> str:
@@ -605,11 +767,17 @@ def scout_restaurant(name: str, url: str, menu_type: str = "daily") -> str:
 
     try:
         if menu_type == "daily":
+            today = datetime.date.today()
+
+            if name.lower() == "fakin":
+                fakin_menu = scrape_fakin_daily_menu(today)
+                if fakin_menu.get("is_daily_menu_available") and fakin_menu.get("specials"):
+                    return json.dumps(fakin_menu, ensure_ascii=False)
+
             markdown = scrape_page(name, url, menu_type=menu_type)
             if not markdown or len(markdown.strip()) < 80:
                 return f"❌ Failed to extract text from {url}"
 
-            today = datetime.date.today()
             current_date = f"{today.day}.{today.month}"
             current_day = datetime.datetime.now().strftime("%A")
 
@@ -663,6 +831,7 @@ def scout_hardcoded_favorites() -> list[dict]:
         raw = scout_restaurant(restaurant["name"], restaurant["url"])
         parsed = normalize_menu_result(raw, display_name=restaurant["name"])
         if parsed:
+            parsed.pop("general_vibe", None)
             results.append(parsed)
     return results
 
@@ -678,7 +847,7 @@ if __name__ == "__main__":
 
     if args.gmaps:
         print("\n--- MODE: GOOGLE MAPS NEARBY EXPLORATION ---")
-        from restaurant_menu_agent.maps_scout import discover_restaurants_with_menus, get_laptop_location
+        from maps_scout import discover_restaurants_with_menus, get_laptop_location
 
         try:
             lat, lng, label = get_laptop_location()

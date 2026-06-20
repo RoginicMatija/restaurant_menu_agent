@@ -27,7 +27,7 @@ def resolve_startup_mode() -> str:
 
 STARTUP_MODE = resolve_startup_mode()
 
-from restaurant_menu_agent.scout import (
+from scout import (
     scout_restaurant,
     scout_hardcoded_favorites,
     has_valid_menu,
@@ -53,7 +53,7 @@ def check_freshness(filepath):
     return file_date == datetime.date.today()
 
 
-def render_restaurant_data(json_filepath):
+def render_restaurant_data(json_filepath, show_vibe: bool = False):
     try:
         with open(json_filepath, "r", encoding="utf-8") as f:
             all_results = json.load(f)
@@ -71,7 +71,9 @@ def render_restaurant_data(json_filepath):
                 meta_parts.append(f"{distance} m away")
             title_suffix = f" | {' · '.join(meta_parts)}" if meta_parts else ""
             st.header(f"🏪 {restaurant.get('restaurant_name', 'Unknown')}{title_suffix}")
-            st.subheader(f"Vibe: *{restaurant.get('general_vibe', '')}*")
+
+            if show_vibe and restaurant.get("general_vibe"):
+                st.subheader(f"Vibe: *{restaurant.get('general_vibe')}*")
 
             if not restaurant.get("is_daily_menu_available"):
                 st.warning("No daily menu for today (restaurant may be closed).")
@@ -121,12 +123,12 @@ if ACTIVE_MODE == "hardcoded":
     st.divider()
 
     if check_freshness(FAVORITES_JSON):
-        render_restaurant_data(FAVORITES_JSON)
+        render_restaurant_data(FAVORITES_JSON, show_vibe=False)
     else:
         st.info("⚠️ Click 'Scan' to load today's menus.")
 
 else:
-    from restaurant_menu_agent.maps_scout import discover_restaurants_with_menus, location_from_coords
+    from maps_scout import discover_restaurants_with_menus, location_from_coords
 
     st.title("📍 GastroScout - Nearby Discovery")
     st.write(
@@ -186,4 +188,4 @@ else:
 
     st.divider()
     if check_freshness(NEARBY_JSON):
-        render_restaurant_data(NEARBY_JSON)
+        render_restaurant_data(NEARBY_JSON, show_vibe=True)
